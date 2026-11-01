@@ -10,8 +10,10 @@ from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     async_fire_time_changed,
 )
+import pytest
 
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.entity_component import DATA_INSTANCES
 
 from custom_components.spook.repairs import (
     AbstractSpookRepair,
@@ -25,6 +27,12 @@ if TYPE_CHECKING:
 
 # Plenty to tell a filtered stream from one that only got debounced together.
 UNRELATED_DEVICES = 25
+
+
+@pytest.fixture(autouse=True)
+def _mock_domain_loaded(hass: HomeAssistant) -> None:
+    """Have the domain the repairs look at be loaded, so their rounds count."""
+    hass.data.setdefault(DATA_INSTANCES, {})["mock"] = object()
 
 
 class _EveryDeviceRepair(AbstractSpookRepair):

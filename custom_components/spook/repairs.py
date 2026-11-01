@@ -876,23 +876,42 @@ class DeviceReferencesRepairMixin:  # pylint: disable=too-few-public-methods
 
     What a round names only counts once the round is done. Until a first one
     is, every event is worth a look; while one runs, the last one done still
-    decides, together with what the running one found so far.
+    decides, together with what the running one found so far. A device that
+    comes or goes while a round runs, and that the round only gets to later,
+    is not in the known devices the round started with or without; so the
+    round looks again once it is done, if it turns out to name one.
     """
 
+    domain: str
     hass: HomeAssistant
+    inspect_debouncer: Debouncer[Coroutine[Any, Any, None]]
     _referenced_device_ids: set[str] | None = None
     _collecting_device_ids: set[str] | None = None
+    _passed_over_device_ids: set[str] | None = None
 
     async def async_inspect(self) -> None:
         """Inspect, and keep the device IDs the round found named."""
+        if self.domain not in self.hass.data.get(DATA_INSTANCES, {}):
+            # Nothing gets looked at, so nothing is found named either. That
+            # is no account of what is named, and must not be kept as one.
+            await super().async_inspect()  # type: ignore[misc]
+            return
+
         self._collecting_device_ids = set()
+        self._passed_over_device_ids = set()
         try:
             await super().async_inspect()  # type: ignore[misc]
         except BaseException:
             self._collecting_device_ids = None
+            self._passed_over_device_ids = None
             raise
         self._referenced_device_ids = self._collecting_device_ids
+        passed_over = self._passed_over_device_ids
         self._collecting_device_ids = None
+        self._passed_over_device_ids = None
+
+        if not self._referenced_device_ids.isdisjoint(passed_over):
+            self.inspect_debouncer.async_schedule_call()
 
     def _remember_referenced_device_ids(self, device_ids: Iterable[str]) -> None:
         """Note device IDs an automation or script names, known or not."""
@@ -923,10 +942,17 @@ class DeviceReferencesRepairMixin:  # pylint: disable=too-few-public-methods
         elif device_entry := dr.async_get(self.hass).async_get(event_data["device_id"]):
             touched.add(getattr(device_entry, "composite_device_id", None))
 
-        return not (
+        if not (
             self._referenced_device_ids.isdisjoint(touched)
             and (self._collecting_device_ids or set()).isdisjoint(touched)
-        )
+        ):
+            return True
+
+        if self._passed_over_device_ids is not None:
+            self._passed_over_device_ids.update(
+                device_id for device_id in touched if isinstance(device_id, str)
+            )
+        return False
 
 
 def _finding_reference(entity_id: str, name: str | AttributeValue) -> str:

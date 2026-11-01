@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
 
+from homeassistant.helpers.entity_component import DATA_INSTANCES
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 import pytest
 
@@ -15,7 +17,8 @@ from custom_components.spook.ectoplasms.automation.repairs.unknown_device_refere
 from tests.device_registry_helpers import simulate_composite_split
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Coroutine, Iterable
+    from typing import Any
 
     from homeassistant.core import HomeAssistant
     from homeassistant.helpers import device_registry as dr
@@ -262,7 +265,7 @@ async def test_a_round_that_fails_keeps_what_the_last_one_found(
 ) -> None:
     """Half a round is no account of what is named."""
     repair = await _inspected(hass, _named_device("a" * 32))
-    repair.hass.data.pop("entity_components", None)
+    hass.data[DATA_INSTANCES] = {repair.domain: object()}
 
     async def _fail(_: SpookRepair) -> None:
         msg = "boom"
@@ -278,6 +281,100 @@ async def test_a_round_that_fails_keeps_what_the_last_one_found(
             await repair.async_inspect()
 
     assert repair._collecting_device_ids is None
+    assert repair._device_registry_event_worth_a_look(
+        {"action": "remove", "device_id": "a" * 32, "device": {}}
+    )
+
+
+def _round_over(
+    *entities: MockAutomationEntity,
+    midway: Callable[[SpookRepair], None],
+) -> Callable[[SpookRepair], Coroutine[Any, Any, None]]:
+    """Return a stand-in for a round, calling ``midway`` when it yields."""
+
+    async def _inspect(repair: SpookRepair) -> None:
+        await repair._async_setup_inspection()
+        for index, entity in enumerate(entities):
+            if index == 1:
+                midway(repair)
+            await repair._async_compute_unknown_references(entity)
+
+    return _inspect
+
+
+async def _inspect_with(
+    repair: SpookRepair,
+    inspect: Callable[[SpookRepair], Coroutine[Any, Any, None]],
+) -> None:
+    """Have ``repair`` do a full round, with ``inspect`` going over entities."""
+    repair.hass.data[DATA_INSTANCES] = {repair.domain: object()}
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            "custom_components.spook.repairs."
+            "AbstractSpookEntityComponentUnknownReferencesRepair.async_inspect",
+            inspect,
+        )
+        await repair.async_inspect()
+
+
+async def test_device_going_before_a_round_gets_to_it_looks_again(
+    hass: HomeAssistant,
+) -> None:
+    """A device removed mid-round is still known to that round, so look again."""
+    repair = await _inspected(hass, _named_device("a" * 32))
+    repair.inspect_debouncer = MagicMock()
+    passed_over: list[bool] = []
+
+    await _inspect_with(
+        repair,
+        _round_over(
+            _named_device("a" * 32),
+            _named_device("c" * 32),
+            midway=lambda r: passed_over.append(
+                r._device_registry_event_worth_a_look(
+                    {"action": "remove", "device_id": "c" * 32, "device": {}}
+                )
+            ),
+        ),
+    )
+
+    assert passed_over == [False]
+    assert repair._referenced_device_ids == {"a" * 32, "c" * 32}
+    repair.inspect_debouncer.async_schedule_call.assert_called_once()
+
+
+async def test_device_nothing_names_passed_over_mid_round_does_not_look_again(
+    hass: HomeAssistant,
+) -> None:
+    """Only a device the round turns out to name is worth the extra round."""
+    repair = await _inspected(hass, _named_device("a" * 32))
+    repair.inspect_debouncer = MagicMock()
+
+    await _inspect_with(
+        repair,
+        _round_over(
+            _named_device("a" * 32),
+            _named_device("c" * 32),
+            midway=lambda r: r._device_registry_event_worth_a_look(
+                {"action": "create", "device_id": "b" * 32}
+            ),
+        ),
+    )
+
+    assert repair._passed_over_device_ids is None
+    repair.inspect_debouncer.async_schedule_call.assert_not_called()
+
+
+async def test_a_round_that_cannot_run_keeps_what_the_last_one_found(
+    hass: HomeAssistant,
+) -> None:
+    """With automations not loaded, a round names nothing, which means nothing."""
+    repair = await _inspected(hass, _named_device("a" * 32))
+    hass.data.pop(DATA_INSTANCES, None)
+
+    await repair.async_inspect()
+
+    assert repair._referenced_device_ids == {"a" * 32}
     assert repair._device_registry_event_worth_a_look(
         {"action": "remove", "device_id": "a" * 32, "device": {}}
     )
